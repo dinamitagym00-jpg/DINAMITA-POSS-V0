@@ -25,6 +25,7 @@
 
   const exportCsvBtn = $("c-exportCsv");
   const exportPdfBtn = $("c-exportPdf");
+  const printQrBtn = $("c-printQr");
 
   function st(){ return dpGetState(); }
   function escapeHtml(s){
@@ -45,6 +46,7 @@
     syncPhotoPreview();
     mode.textContent = "Modo: Editar";
     status.textContent = "";
+    if(printQrBtn) printQrBtn.disabled = false;
     window.scrollTo({top:0, behavior:"smooth"});
   }
 
@@ -60,6 +62,7 @@
     syncPhotoPreview();
     mode.textContent = "Modo: Nuevo";
     status.textContent = "";
+    if(printQrBtn) printQrBtn.disabled = true;
   }
 
   function syncPhotoPreview(){
@@ -258,6 +261,153 @@ ${clients.map(c=>`
     w.print();
   }
 
+  // --- Credencial con QR (impresión 58mm) ---
+  async function getQrDataUrl(text){
+    const key = `qr:${text}`;
+    // 1) cache en IndexedDB
+    try{
+      const cached = await dpIdbGet(key);
+      if(cached && typeof cached === 'string' && cached.startsWith('data:image')) return cached;
+    }catch(e){}
+
+    // 2) generar por primera vez usando servicio QR (requiere internet). Luego queda guardado.
+    // (Elegimos qrserver porque devuelve imagen PNG simple.)
+    const url = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(text)}`;
+    const res = await fetch(url, { cache: 'no-store' });
+    if(!res.ok) throw new Error('No se pudo generar el QR (sin internet o bloqueado).');
+    const blob = await res.blob();
+    const dataUrl = await blobToDataUrl(blob);
+    try{ await dpIdbSet(key, dataUrl); }catch(e){}
+    return dataUrl;
+  }
+
+  function blobToDataUrl(blob){
+    return new Promise((resolve, reject)=>{
+      const fr = new FileReader();
+      fr.onload = ()=>resolve(fr.result);
+      fr.onerror = ()=>reject(fr.error||new Error('FileReader error'));
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  async function printQrCredential(){
+    const id = (idInput.value||'').trim();
+    if(!id){
+      alert('Primero selecciona un cliente (o captura su ID) para imprimir la credencial.');
+      return;
+    }
+    const c = dpClientsGetById(id);
+    if(!c){
+      alert('Cliente no encontrado.');
+      return;
+    }
+    let qrDataUrl = '';
+    try{
+      qrDataUrl = await getQrDataUrl(id);
+    }catch(err){
+      alert(String(err && err.message ? err.message : err));
+      return;
+    }
+
+    const gym = dpGetCfg('businessName') || 'Dinamita Gym';
+    const wa = dpGetCfg('whatsapp') || '56 4319 5153';
+
+    const safeName = escapeHtml(c.name||'');
+    const safeId = escapeHtml(c.id||'');
+    const headerSmall = (c.phone||c.email||'').trim();
+
+    const html = `
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Credencial</title>
+  <style>
+    @page { size: 58mm auto; margin: 0; }
+    html,body{ margin:0; padding:0; }
+    body{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+          width:58mm; }
+    .t{ padding: 6mm 3mm 4mm; }
+    .center{ text-align:center; }
+    .h1{ font-size: 13px; font-weight:700; letter-spacing:0.4px; }
+    .muted{ font-size: 10px; opacity:0.8; }
+    .name{ font-size: 16px; font-weight:800; margin-top: 6px; }
+    .id{ font-size: 22px; font-weight:900; letter-spacing:1px; margin: 4px 0 0; }
+    .box{ border: 2px dashed #333; border-radius:10px; padding: 6px 0 8px; margin: 8px 0 6px; }
+    img.qr{ width: 40mm; height: 40mm; image-rendering: pixelated; }
+    .foot{ margin-top: 4px; font-size: 12px; font-weight:700; }
+    .hr{ border-top: 1px dashed #888; margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <div class="t">
+    <div class="center">
+      <div class="h1">${escapeHtml(gym)}</div>
+      ${headerSmall?`<div class="muted">${escapeHtml(headerSmall)}</div>`:''}
+      <div class="hr"></div>
+      <div class="name">${safeName}</div>
+      <div class="muted">ID</div>
+      <div class="id">${safeId}</div>
+      <div class="box">
+        <div class="muted" style="margin-bottom:4px;">Escanea este QR</div>
+        <img class="qr" src="${qrDataUrl}" alt="QR" />
+      </div>
+      <div class="muted">WhatsApp</div>
+      <div class="foot">${escapeHtml(wa)}</div>
+    </div>
+  </div>
+</body>
+</html>`;
+
+    dpPrintHTML(html);
+  }
+
+  // Impresión robusta (Android/Tablet): imprime el HTML en un iframe oculto
+  function dpPrintHTML(html){
+    try{
+      const iframe = document.createElement('iframe');
+      iframe.style.position = 'fixed';
+      iframe.style.right = '0';
+      iframe.style.bottom = '0';
+      iframe.style.width = '0';
+      iframe.style.height = '0';
+      iframe.style.border = '0';
+      iframe.setAttribute('aria-hidden','true');
+      document.body.appendChild(iframe);
+
+      const doc = iframe.contentWindow.document;
+      doc.open();
+      doc.write(html);
+      doc.close();
+
+      const doPrint = ()=>{
+        try{
+          iframe.contentWindow.focus();
+          iframe.contentWindow.print();
+        }finally{
+          setTimeout(()=>{ try{ document.body.removeChild(iframe); }catch(e){} }, 1200);
+        }
+      };
+
+      // espera imágenes
+      const imgs = doc.images ? Array.from(doc.images) : [];
+      if(imgs.length===0){
+        setTimeout(doPrint, 250);
+        return;
+      }
+      let pending = imgs.length;
+      const done = ()=>{ pending--; if(pending<=0) setTimeout(doPrint, 150); };
+      imgs.forEach(img=>{
+        if(img.complete) return done();
+        img.addEventListener('load', done, {once:true});
+        img.addEventListener('error', done, {once:true});
+      });
+    }catch(err){
+      alert('No se pudo imprimir: ' + (err?.message||err));
+    }
+  }
+
   // events
   form.addEventListener("submit", save);
   photo.addEventListener("change", onPhotoChange);
@@ -266,6 +416,7 @@ ${clients.map(c=>`
   search.addEventListener("input", render);
   exportCsvBtn.addEventListener("click", exportCsv);
   exportPdfBtn.addEventListener("click", exportPdf);
+  printQrBtn.addEventListener("click", printQrCredential);
 
   // init
   try{ dpEnsureSeedData(); }catch(e){}
