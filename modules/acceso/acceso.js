@@ -178,7 +178,52 @@
     }).join("");
   }
 
-  function escapeHtml(s){
+  
+  // Imprimir HTML sin popups (mejor en tablet/Android)
+  function dpPrintInIframe(html){
+    const iframe = document.createElement('iframe');
+    iframe.style.position='fixed';
+    iframe.style.right='0';
+    iframe.style.bottom='0';
+    iframe.style.width='0';
+    iframe.style.height='0';
+    iframe.style.border='0';
+    iframe.style.opacity='0';
+    iframe.setAttribute('aria-hidden','true');
+    document.body.appendChild(iframe);
+    const doc = iframe.contentDocument || iframe.contentWindow.document;
+    doc.open(); doc.write(html); doc.close();
+    setTimeout(()=>{
+      try{ iframe.contentWindow.focus(); iframe.contentWindow.print(); }catch(e){}
+      setTimeout(()=>{ try{ iframe.remove(); }catch(e){} }, 800);
+    }, 350);
+  }
+
+  async function blobToDataUrl(blob){
+    return await new Promise((resolve,reject)=>{
+      const r = new FileReader();
+      r.onload = ()=>resolve(r.result);
+      r.onerror = reject;
+      r.readAsDataURL(blob);
+    });
+  }
+
+  async function getQrDataUrl(text){
+    const key = `qr:${text}`;
+    try{
+      const cached = await dpIdbGet(key);
+      if(cached && typeof cached === 'string' && cached.startsWith('data:image')) return cached;
+    }catch(e){}
+    const url = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(text)}`;
+    const res = await fetch(url, { cache: 'no-store' });
+    if(!res.ok) throw new Error('QR gen fail');
+    const blob = await res.blob();
+    const dataUrl = await blobToDataUrl(blob);
+    try{ await dpIdbSet(key, dataUrl); }catch(e){}
+    return dataUrl;
+  }
+
+function escapeHtml(s){
     return String(s||"").replace(/[&<>"']/g, (c)=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
   }
 
@@ -349,65 +394,48 @@
     renderAfterLog();
   }
 
-  function printCredential(clientId){
-    const st = state();
-    const c = (st.clients||[]).find(x=>x.id===clientId);
-    if(!c) return;
+  async function printCredential(clientId){
+    const c = dpClientsGetById(clientId);
+    if(!c){ alert("Cliente no encontrado."); return; }
 
-    const cfg = (st.meta||{}).business || {};
-    const name = cfg.name || "Dinamita Gym";
-    const phone = cfg.phone || "56 4319 5153";
+    let qrDataUrl = '';
+    try{
+      qrDataUrl = await getQrDataUrl(`DINAMITA:${clientId}`);
+    }catch(e){
+      alert("No se pudo generar el QR. Verifica internet la primera vez (después queda guardado).");
+      return;
+    }
 
-    // QR: por simplicidad, se imprime el texto (ID). Más adelante podemos generar QR gráfico.
-    const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"/>
-      <meta name="viewport" content="width=device-width,initial-scale=1"/>
-      <title>Credencial</title>
-      <style>
-        body{font-family:system-ui,Arial;margin:0;padding:12px}
-        .card{border:2px solid #000;border-radius:12px;padding:14px;max-width:380px}
-        .brand{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-        .logo{width:44px;height:44px;border-radius:10px;object-fit:cover;border:1px solid #000}
-        h1{font-size:16px;margin:0}
-        .sub{font-size:12px;opacity:.8}
-        .row{margin-top:10px}
-        .lbl{font-size:12px;opacity:.7}
-        .val{font-size:18px;font-weight:800}
-        .qr{margin-top:12px;border:2px dashed #000;border-radius:12px;padding:14px;text-align:center}
-        .qr .code{font-size:28px;font-weight:900;letter-spacing:1px}
-        .hint{font-size:12px;opacity:.8;margin-top:8px}
-        @media print{ body{padding:0} .card{border:none} }
-      </style>
-    </head><body>
-      <div class="card">
-        <div class="brand">
-          ${(cfg.logoData ? `<img class="logo" src="${cfg.logoData}" />` : `<div class="logo" style="display:flex;align-items:center;justify-content:center;font-weight:900;">DG</div>`)}
-          <div>
-            <h1>${escapeHtml(name)}</h1>
-            <div class="sub">Credencial de socio</div>
-          </div>
-        </div>
-
-        <div class="row"><div class="lbl">Nombre</div><div class="val">${escapeHtml(c.name||"")}</div></div>
-        <div class="row"><div class="lbl">ID</div><div class="val">${escapeHtml(c.id||"")}</div></div>
-
-        <div class="qr">
-          <div class="lbl">Escanea este código</div>
-          <div class="code">${escapeHtml(c.id||"")}</div>
-          <div class="hint">Puedes imprimir este ID como QR/Barcode en una versión PRO.</div>
-        </div>
-
-        <div class="row"><div class="lbl">WhatsApp</div><div class="val" style="font-size:16px">${escapeHtml(phone)}</div></div>
-      </div>
-      <script>
-        setTimeout(()=>{ window.print(); }, 300);
-      </script>
-    </body></html>`;
-
-    // imprime en ventana aparte (credencial normalmente se imprime en PC)
-    const w = window.open("", "_blank");
-    if(!w){ alert("Permite ventanas emergentes para imprimir credencial."); return; }
-    w.document.open(); w.document.write(html); w.document.close();
+    const safeName = escapeHtml((c.name||'').trim());
+    const html = `<!doctype html>
+<html><head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Credencial</title>
+<style>
+  @page{ size:58mm auto; margin:0; }
+  html,body{ margin:0; padding:0; }
+  body{
+    width:58mm;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-weight:700;
+    color:#000;
   }
+  .wrap{ padding:6mm 3mm 5mm; text-align:center; }
+  .name{ font-size:15px; line-height:1.15; margin:0 0 5mm; word-break:break-word; }
+  .qr{ width:34mm; height:34mm; margin:0 auto; }
+  .qr img{ width:100%; height:100%; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="name">${safeName}</div>
+    <div class="qr"><img src="${qrDataUrl}" alt="QR" /></div>
+  </div>
+</body></html>`;
+    dpPrintInIframe(html);
+  }
+
 
   init();
 })();
