@@ -1,441 +1,400 @@
-/* Acceso - Dinamita POS v0 (IndexedDB local) */
+/* Dinamita POS v0 - Acceso (IndexedDB state)
+   - Fix: JS roto (async async)
+   - Renderiza historial (st.accessLog)
+   - Validación por QR/ID/Nombre + anti-passback
+   - Imprimir credencial 58mm: Nombre + ID + QR (sin WhatsApp)
+*/
+
 (function(){
-  const $ = (id)=>document.getElementById(id);
-  const scan = $("a-scan");
-  const status = $("a-status");
-  const lastBox = $("a-last");
-  const btnCheck = $("a-check");
-  const btnRenew = $("a-renew");
-  const btnPrint = $("a-print");
-  const btnClear = $("a-clear");
-  const apm = $("a-apm");
-  const filter = $("a-filter");
-  const btnExport = $("a-export");
-  const tbody = $("a-table").querySelector("tbody");
-  const btnMode = $("a-toggleMode");
+  'use strict';
 
-  // --- helpers ---
-  const fmtMoney = (n)=>"$" + (Number(n||0)).toFixed(2);
-  const todayISO = ()=> new Date().toISOString().slice(0,10);
-  const nowISO = ()=> new Date().toISOString();
+  const $ = (sel) => document.querySelector(sel);
 
-  function state(){ return dpGetState(); }
-
-  function getAccessSettings(){
-    const st = state();
-    st.meta = st.meta || {};
-    st.meta.accessSettings = st.meta.accessSettings || { antiPassbackMinutes: 10 };
-    return st.meta.accessSettings;
+  function fmtDateTime(ts){
+    try{
+      const d = new Date(ts);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth()+1).padStart(2,'0');
+      const dd = String(d.getDate()).padStart(2,'0');
+      const hh = String(d.getHours()).padStart(2,'0');
+      const mi = String(d.getMinutes()).padStart(2,'0');
+      const ss = String(d.getSeconds()).padStart(2,'0');
+      return { date: `${yyyy}-${mm}-${dd}`, time: `${hh}:${mi}:${ss}` };
+    }catch{ return { date:'', time:'' }; }
   }
 
-  function setAccessSettings(patch){
-    dpSetState(st=>{
-      st.meta = st.meta || {};
-      st.meta.accessSettings = st.meta.accessSettings || { antiPassbackMinutes: 10 };
-      Object.assign(st.meta.accessSettings, patch||{});
-      return st;
-    });
+  function safeText(s){
+    return String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  function ensureAccessArrays(){
-    dpSetState(st=>{
-      if(!Array.isArray(st.accessLogs)) st.accessLogs = [];
-      st.meta = st.meta || {};
-      st.meta.accessSettings = st.meta.accessSettings || { antiPassbackMinutes: 10 };
-      return st;
-    });
+  function normalizeScan(input){
+    const s = String(input||'').trim();
+    // si viene un URL tipo ...?c=C001, tomar la parte final
+    const m = s.match(/\b(C\d{3,})\b/i);
+    if(m) return m[1].toUpperCase();
+    return s;
   }
 
-  function findClientByToken(token){
-    const st = state();
-    const t = String(token||"").trim();
-    if(!t) return null;
-    // 1) ID exacto (C001)
-    const byId = (st.clients||[]).find(c=>String(c.id||"").toLowerCase()===t.toLowerCase());
-    if(byId) return byId;
-
-    // 2) si el QR trae prefijo, ej "DINAMITA:C001"
-    const m = t.match(/(C\d{3})/i);
-    if(m){
-      const id = m[1].toUpperCase();
-      const c = (st.clients||[]).find(x=>x.id===id);
-      if(c) return c;
-    }
-
-    // 3) por nombre / teléfono
-    const lower = t.toLowerCase();
-    return (st.clients||[]).find(c=>
-      String(c.name||"").toLowerCase().includes(lower) ||
-      String(c.phone||"").replace(/\D/g,'').includes(lower.replace(/\D/g,''))
-    ) || null;
-  }
-
-  function getMembershipStatus(clientId){
-    const st = state();
-    const list = (st.memberships||[]).filter(m=>m && m.clientId===clientId);
-    if(list.length===0) return { status:"none", label:"Sin membresía", detail:"", color:"red" };
-
-    const t = todayISO();
-    // buscar una membresía activa hoy (start<=hoy<=end) con end más lejano
-    const active = list
-      .filter(m=> (m.start||"")<=t && (m.end||"")>=t)
-      .sort((a,b)=> String(b.end||"").localeCompare(String(a.end||"")));
-    const m = active[0] || list[0];
-
-    const end = m.end || "";
-    const start = m.start || "";
-    if(end < t){
-      return { status:"expired", label:"Vencida", detail:`Venció: ${end}`, color:"red", membership:m };
-    }
-    // days left
-    const dEnd = new Date(end);
-    const dNow = new Date(t);
-    const diff = Math.ceil((dEnd - dNow)/(1000*60*60*24));
-    if(diff <= 5){
-      return { status:"warning", label:"Por vencer", detail:`Vence: ${end} (${diff} día(s))`, color:"orange", membership:m };
-    }
-    return { status:"active", label:"Activa", detail:`Vence: ${end}`, color:"green", membership:m };
-  }
-
-  function getLastAllowedAccess(clientId){
-    const st = state();
-    const logs = (st.accessLogs||[]).filter(x=>x && x.clientId===clientId && x.result==="allowed");
-    if(logs.length===0) return null;
-    return logs[0]; // unshift (más reciente)
-  }
-
-  function logAccess({clientId, clientName, result, detail, method="qr"}){
-    dpSetState(st=>{
-      st.accessLogs = st.accessLogs || [];
-      const at = nowISO();
-      st.accessLogs.unshift({
-        id: dpId("A"),
-        at,
-        date: at.slice(0,10),
-        time: at.slice(11,19),
-        clientId: clientId || "",
-        clientName: clientName || "",
-        result,
-        detail: detail || "",
-        method
+  async function getQrDataUrl(text){
+    const payload = String(text||'').trim();
+    if(!payload) return null;
+    try{
+      const url = `https://api.qrserver.com/v1/create-qr-code/?size=170x170&margin=2&data=${encodeURIComponent(payload)}&t=${Date.now()}`;
+      const res = await fetch(url, { cache: 'no-store' });
+      if(!res.ok) throw new Error('qr fetch');
+      const blob = await res.blob();
+      const dataUrl = await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result);
+        r.onerror = () => reject(new Error('read')); 
+        r.readAsDataURL(blob);
       });
-      // recortar para evitar crecer infinito
-      if(st.accessLogs.length > 5000) st.accessLogs.length = 5000;
-      return st;
-    });
-  }
-
-  function setStatus(kind, title, meta){
-    status.classList.remove("dp-accessIdle","dp-accessOk","dp-accessWarn","dp-accessBad");
-    if(kind==="ok") status.classList.add("dp-accessOk");
-    else if(kind==="warn") status.classList.add("dp-accessWarn");
-    else if(kind==="bad") status.classList.add("dp-accessBad");
-    else status.classList.add("dp-accessIdle");
-    status.querySelector(".dp-accessTitle")?.remove();
-    status.querySelector(".dp-accessMeta")?.remove();
-    const t = document.createElement("div");
-    t.className="dp-accessTitle";
-    t.textContent = title || "";
-    const m = document.createElement("div");
-    m.className="dp-accessMeta";
-    m.textContent = meta || "";
-    status.appendChild(t);
-    status.appendChild(m);
-  }
-
-  function renderLast(info){
-    const rows = [];
-    const add = (k,v)=>rows.push(`<div class="dp-kvRow"><div class="dp-kvK">${k}</div><div class="dp-kvV">${v||""}</div></div>`);
-    if(!info){ lastBox.innerHTML = '<div class="dp-hint">Aún no hay accesos.</div>'; return; }
-    add("Cliente", `<b>${info.clientName}</b> (${info.clientId})`);
-    add("Resultado", `<b>${info.result.toUpperCase()}</b>`);
-    add("Detalle", info.detail || "");
-    add("Fecha/Hora", `${info.date} ${info.time}`);
-    lastBox.innerHTML = rows.join("");
-  }
-
-  function renderTable(){
-    const st = state();
-    const q = String(filter.value||"").trim().toLowerCase();
-    const logs = (st.accessLogs||[]);
-    const view = q ? logs.filter(x=>
-      (x.clientName||"").toLowerCase().includes(q) ||
-      (x.clientId||"").toLowerCase().includes(q) ||
-      (x.result||"").toLowerCase().includes(q) ||
-      (x.detail||"").toLowerCase().includes(q)
-    ) : logs;
-
-    tbody.innerHTML = view.slice(0,200).map(x=>{
-      const badge = x.result==="allowed" ? "dp-badgeOk" : (x.result==="warning" ? "dp-badgeWarn" : "dp-badgeBad");
-      const label = x.result==="allowed" ? "PERMITIDO" : (x.result==="warning" ? "AVISO" : "DENEGADO");
-      return `<tr>
-        <td>${x.date||""}</td>
-        <td>${x.time||""}</td>
-        <td><b>${escapeHtml(x.clientName||"")}</b><div class="dp-hint">${escapeHtml(x.clientId||"")}</div></td>
-        <td><span class="dp-badge ${badge}">${label}</span></td>
-        <td>${escapeHtml(x.detail||"")}</td>
-      </tr>`;
-    }).join("");
-  }
-
-  
-  // Imprimir HTML sin popups (mejor en tablet/Android)
-  function dpPrintInIframe(html){
-    const iframe = document.createElement('iframe');
-    iframe.style.position='fixed';
-    iframe.style.right='0';
-    iframe.style.bottom='0';
-    iframe.style.width='0';
-    iframe.style.height='0';
-    iframe.style.border='0';
-    iframe.style.opacity='0';
-    iframe.setAttribute('aria-hidden','true');
-    document.body.appendChild(iframe);
-    const doc = iframe.contentDocument || iframe.contentWindow.document;
-    doc.open(); doc.write(html); doc.close();
-    setTimeout(()=>{
-      try{ iframe.contentWindow.focus(); iframe.contentWindow.print(); }catch(e){}
-      setTimeout(()=>{ try{ iframe.remove(); }catch(e){} }, 800);
-    }, 350);
-  }
-
-  async function blobToDataUrl(blob){
-    return await new Promise((resolve,reject)=>{
-      const r = new FileReader();
-      r.onload = ()=>resolve(r.result);
-      r.onerror = reject;
-      r.readAsDataURL(blob);
-    });
-  }
-
-  async async function getQrDataUrl(text){
-    const key = `qr:${text}`;
-    try{
-      const cached = await dpIdbGet(key);
-      if(cached && typeof cached === 'string' && cached.startsWith('data:image')) return cached;
-    }catch(e){}
-    const url = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(text)}`;
-    const res = await fetch(url, { cache: 'no-store' });
-    if(!res.ok) throw new Error('QR gen fail');
-    const blob = await res.blob();
-    const dataUrl = await blobToDataUrl(blob);
-    try{ await dpIdbSet(key, dataUrl); }catch(e){}
-    return dataUrl;
-  }
-
-function escapeHtml(s){
-    return String(s||"").replace(/[&<>"']/g, (c)=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
-  }
-
-  function exportCSV(){
-    const st = state();
-    const rows = [["Fecha","Hora","Cliente","ID","Resultado","Detalle"]];
-    (st.accessLogs||[]).forEach(x=>{
-      rows.push([x.date||"", x.time||"", x.clientName||"", x.clientId||"", x.result||"", x.detail||""]);
-    });
-    const csv = rows.map(r=>r.map(v=>{
-      const s = String(v??"");
-      return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
-    }).join(",")).join("\n");
-    const blob = new Blob([csv], {type:"text/csv;charset=utf-8"});
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `accesos_${todayISO()}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
-  }
-
-  function validate(){
-    const token = String(scan.value||"").trim();
-    if(!token){ setStatus("bad","Sin dato","Escanea un código o escribe un nombre/ID."); return; }
-
-    const client = findClientByToken(token);
-    if(!client){
-      setStatus("bad","No encontrado","No existe cliente con ese dato.");
-      btnRenew.disabled = true;
-      btnPrint.disabled = true;
-      logAccess({ clientId:"", clientName:"", result:"denied", detail:`No encontrado (${token})` });
-      renderAfterLog();
-      return;
-    }
-
-    const settings = getAccessSettings();
-    const mins = Number(settings.antiPassbackMinutes||0);
-    const lastAllowed = getLastAllowedAccess(client.id);
-    if(mins>0 && lastAllowed){
-      const lastAt = new Date(lastAllowed.at);
-      const now = new Date();
-      const diffMin = (now - lastAt) / (1000*60);
-      if(diffMin < mins){
-        const left = Math.ceil(mins - diffMin);
-        setStatus("bad","Anti-passback","Entrada repetida. Espera " + left + " min.");
-        btnRenew.disabled = false; // puede renovar aunque sea passback
-        btnPrint.disabled = false;
-        logAccess({ clientId: client.id, clientName: client.name, result:"denied", detail:`Anti-passback (${Math.round(diffMin)} min)` });
-        renderAfterLog();
-        return;
-      }
-    }
-
-    const ms = getMembershipStatus(client.id);
-    if(ms.status==="active"){
-      setStatus("ok","Acceso permitido", `${client.name} • ${ms.detail}`);
-      logAccess({ clientId: client.id, clientName: client.name, result:"allowed", detail:`${ms.label} • ${ms.detail}` });
-      btnRenew.disabled = false;
-      btnPrint.disabled = false;
-    }else if(ms.status==="warning"){
-      setStatus("warn","Acceso permitido (por vencer)", `${client.name} • ${ms.detail}`);
-      logAccess({ clientId: client.id, clientName: client.name, result:"warning", detail:`${ms.label} • ${ms.detail}` });
-      btnRenew.disabled = false;
-      btnPrint.disabled = false;
-    }else{
-      setStatus("bad","Acceso denegado", `${client.name} • ${ms.detail || ms.label}`);
-      logAccess({ clientId: client.id, clientName: client.name, result:"denied", detail:`${ms.label} • ${ms.detail}` });
-      btnRenew.disabled = false;
-      btnPrint.disabled = false;
-    }
-
-    // Guardar para renovar/credencial
-    sessionStorage.setItem("dp_prefill_client_id", client.id);
-    renderAfterLog();
-  }
-
-  function renderAfterLog(){
-    const st = state();
-    const last = (st.accessLogs||[])[0] || null;
-    renderLast(last);
-    renderTable();
-  }
-
-  // --- modo acceso (bloqueo de navegación) ---
-  function isAccessMode(){
-    return sessionStorage.getItem("dp_access_mode")==="1";
-  }
-  function setAccessMode(on){
-    sessionStorage.setItem("dp_access_mode", on ? "1":"0");
-    document.body.classList.toggle("dp-accessMode", !!on);
-    btnMode.textContent = on ? "Modo Acceso: ON" : "Modo Acceso: OFF";
-  }
-
-  function requirePin(){
-    // Reutiliza PIN de configuración si existe, sino "1234"
-    const st = state();
-    const pin = String(st.meta?.securityPin || "1234");
-    const input = prompt("PIN para salir/entrar a Modo Acceso:");
-    return input === pin;
-  }
-
-  function init(){
-    ensureAccessArrays();
-
-    const s = getAccessSettings();
-    apm.value = String(Number(s.antiPassbackMinutes ?? 10));
-
-    // Focus listo para lector
-    setTimeout(()=>scan.focus(), 150);
-
-    // Enter dispara
-    scan.addEventListener("keydown", (e)=>{
-      if(e.key==="Enter"){
-        e.preventDefault();
-        validate();
-      }
-    });
-
-    btnCheck.addEventListener("click", validate);
-
-    btnClear.addEventListener("click", ()=>{
-      scan.value="";
-      scan.focus();
-      btnRenew.disabled = true;
-      btnPrint.disabled = true;
-      setStatus("idle","Listo para escanear","Escanea un código o escribe un nombre/ID.");
-    });
-
-    apm.addEventListener("change", ()=>{
-      const v = Math.max(0, Math.floor(Number(apm.value||0)));
-      apm.value = String(v);
-      setAccessSettings({ antiPassbackMinutes: v });
-    });
-
-    filter.addEventListener("input", renderTable);
-    btnExport.addEventListener("click", exportCSV);
-
-    btnRenew.addEventListener("click", ()=>{
-      const id = sessionStorage.getItem("dp_prefill_client_id") || "";
-      if(!id) return;
-      // Navega a Membresías y precarga cliente (requiere pequeño hook en módulo membresías)
-      try{ sessionStorage.setItem("dp_prefill_client_id", id); }catch(e){}
-      const btn = document.querySelector('#menu button[data-module="membresias"]');
-      if(btn) btn.click();
-    });
-
-    btnPrint.addEventListener("click", ()=>{
-      const id = sessionStorage.getItem("dp_prefill_client_id") || "";
-      if(!id) return;
-      printCredential(id);
-    });
-
-    btnMode.addEventListener("click", ()=>{
-      const on = isAccessMode();
-      if(!on){
-        if(requirePin()) setAccessMode(true);
-      }else{
-        if(requirePin()) setAccessMode(false);
-      }
-    });
-
-    // aplicar modo acceso si ya estaba
-    setAccessMode(isAccessMode());
-
-    // Render inicial
-    renderAfterLog();
-  }
-
-  async async function printCredential(clientId){
-    const c = dpClientsGetById(clientId);
-    if(!c){ alert("Cliente no encontrado."); return; }
-
-    let qrDataUrl = '';
-    try{
-      qrDataUrl = await getQrDataUrl(`DINAMITA:${clientId}`);
+      return dataUrl;
     }catch(e){
-      alert("No se pudo generar el QR. Verifica internet la primera vez (después queda guardado).");
-      return;
+      return null;
     }
-
-    const safeName = escapeHtml((c.name||'').trim());
-    const html = `<!doctype html>
-<html><head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Credencial</title>
-<style>
-  @page{ size:58mm auto; margin:0; }
-  html,body{ margin:0; padding:0; }
-  body{
-    width:58mm;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-weight:700;
-    color:#000;
   }
-  .wrap{ padding:6mm 3mm 5mm; text-align:center; }
-  .name{ font-size:15px; line-height:1.15; margin:0 0 5mm; word-break:break-word; }
-  .qr{ width:34mm; height:34mm; margin:0 auto; }
-  .qr img{ width:100%; height:100%; image-rendering: pixelated; }
-</style>
+
+  function buildPrintHtml({ gymName='Dinamita Gym', fullName, code, qrDataUrl }){
+    return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Credencial</title>
+  <style>
+    @page { size: 58mm auto; margin: 0; }
+    html, body { margin:0; padding:0; }
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 12px; }
+    .wrap { width: 58mm; padding: 6mm 4mm; }
+    .center { text-align:center; }
+    .title { font-weight: 700; font-size: 16px; }
+    .name { font-weight: 800; font-size: 18px; margin-top: 8px; }
+    .code { font-weight: 800; font-size: 22px; letter-spacing: 1px; margin-top: 6px; }
+    .qr { margin: 10px 0 0; }
+    .qr img { width: 34mm; height: 34mm; image-rendering: pixelated; }
+    .muted { color: #444; font-size: 11px; }
+    .hr { border-top: 1px dashed #777; margin: 10px 0; }
+  </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="name">${safeName}</div>
-    <div class="qr"><img src="${qrDataUrl}" alt="QR" /></div>
+    <div class="center title">${safeText(gymName)}</div>
+    <div class="hr"></div>
+    <div class="center name">${safeText(fullName || '')}</div>
+    <div class="center code">${safeText(code || '')}</div>
+    <div class="center qr">
+      ${qrDataUrl ? `<img alt="QR" src="${qrDataUrl}" />` : `<div class="muted">(QR sin conexión)</div>`}
+    </div>
+    <div class="center muted" style="margin-top:8px;">Escanea para acceso</div>
   </div>
-</body></html>`;
-    dpPrintInIframe(html);
+</body>
+</html>`;
   }
 
+  async function printCredentialForClient(client){
+    const fullName = client?.name || client?.nombre || '';
+    const code = client?.id || client?.codigo || '';
+    if(!fullName || !code){
+      alert('Primero selecciona / valida un cliente.');
+      return;
+    }
+    const qr = await getQrDataUrl(code);
+    const html = buildPrintHtml({ fullName, code, qrDataUrl: qr });
+    const w = window.open('', '_blank');
+    if(!w){
+      alert('Tu navegador bloqueó la ventana de impresión. Permite popups para imprimir.');
+      return;
+    }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    // dar tiempo a cargar imagen
+    setTimeout(() => {
+      try{ w.focus(); w.print(); }catch(e){}
+    }, 300);
+  }
 
-  init();
+  function findClient(st, scan){
+    const q = String(scan||'').trim().toLowerCase();
+    if(!q) return null;
+    const clients = Array.isArray(st.clients) ? st.clients : [];
+    // match exact ID
+    let c = clients.find(x => String(x.id||'').toLowerCase() === q);
+    if(c) return c;
+    // match name contains
+    c = clients.find(x => String(x.name||'').toLowerCase().includes(q));
+    return c || null;
+  }
+
+  function getActiveMembershipForClient(st, clientId){
+    const mems = Array.isArray(st.memberships) ? st.memberships : [];
+    // membership is active if status === 'ACTIVE' and endDate >= today
+    const now = Date.now();
+    const byClient = mems
+      .filter(m => String(m.clientId||m.clienteId||'') === String(clientId||''))
+      .map(m => {
+        const end = m.endDate || m.fechaFin || m.vencimiento || m.expiresAt;
+        const endTs = end ? new Date(end).getTime() : NaN;
+        return { m, endTs };
+      })
+      .filter(x => !Number.isNaN(x.endTs))
+      .sort((a,b) => b.endTs - a.endTs);
+
+    const cand = byClient[0]?.m || null;
+    if(!cand) return null;
+    const endTs = byClient[0].endTs;
+    if(endTs < now) return null;
+    // status puede variar
+    const status = String(cand.status||cand.estado||'ACTIVE').toUpperCase();
+    if(status === 'CANCELLED' || status === 'CANCELED') return null;
+    return { membership: cand, endTs };
+  }
+
+  function lastAllowedWithin(st, clientId, minutes){
+    const log = Array.isArray(st.accessLog) ? st.accessLog : [];
+    const ms = Math.max(0, Number(minutes||0)) * 60 * 1000;
+    if(ms <= 0) return null;
+    const now = Date.now();
+    const last = [...log]
+      .reverse()
+      .find(r => String(r.clientId||'') === String(clientId||'') && String(r.result||'') === 'ALLOWED');
+    if(!last) return null;
+    const ts = Number(last.ts || last.timestamp || 0);
+    if(!ts) return null;
+    return (now - ts) < ms ? last : null;
+  }
+
+  function setStatus({ title, subtitle, badgeClass }){
+    const card = $('#access-status');
+    const h = $('#access-status-title');
+    const p = $('#access-status-sub');
+    if(!card || !h || !p) return;
+    card.className = `dp-card status ${badgeClass||''}`.trim();
+    h.textContent = title || '';
+    p.textContent = subtitle || '';
+  }
+
+  function renderLastAccess(st){
+    const box = $('#last-access');
+    if(!box) return;
+    const log = Array.isArray(st.accessLog) ? st.accessLog : [];
+    const last = log[log.length-1];
+    if(!last){
+      box.innerHTML = '<div class="muted">Sin registros aún.</div>';
+      return;
+    }
+    const dt = fmtDateTime(last.ts || last.timestamp || Date.now());
+    box.innerHTML = `
+      <div><b>Cliente</b>: ${safeText(last.clientName||'')}</div>
+      <div><b>Resultado</b>: ${safeText(last.result||'')}</div>
+      <div><b>Detalle</b>: ${safeText(last.detail||'')}</div>
+      <div><b>Fecha/Hora</b>: ${safeText(dt.date)} ${safeText(dt.time)}</div>
+    `;
+  }
+
+  function renderLogTable(st){
+    const tbody = $('#access-log-body');
+    if(!tbody) return;
+    const q = String($('#access-search')?.value || '').trim().toLowerCase();
+    const log = Array.isArray(st.accessLog) ? st.accessLog : [];
+    const rows = log
+      .slice()
+      .reverse()
+      .filter(r => {
+        if(!q) return true;
+        const blob = `${r.clientName||''} ${r.clientId||''} ${r.result||''} ${r.detail||''}`.toLowerCase();
+        return blob.includes(q);
+      })
+      .slice(0, 50);
+
+    tbody.innerHTML = rows.map(r => {
+      const dt = fmtDateTime(r.ts || r.timestamp || Date.now());
+      const badge = String(r.result||'') === 'ALLOWED' ? 'badge ok' : 'badge bad';
+      const label = String(r.result||'') === 'ALLOWED' ? 'PERMITIDO' : 'DENEGADO';
+      return `
+        <tr>
+          <td>${safeText(dt.date)}</td>
+          <td>${safeText(dt.time)}</td>
+          <td><b>${safeText(r.clientName||'')}</b><div class="muted">${safeText(r.clientId||'')}</div></td>
+          <td><span class="${badge}">${label}</span></td>
+          <td class="muted">${safeText(r.detail||'')}</td>
+        </tr>
+      `;
+    }).join('') || '<tr><td colspan="5" class="muted">Sin registros.</td></tr>';
+  }
+
+  function exportCsv(st){
+    const log = Array.isArray(st.accessLog) ? st.accessLog : [];
+    const header = ['Fecha','Hora','Cliente','ID','Resultado','Detalle'];
+    const lines = [header.join(',')];
+    for(const r of log){
+      const dt = fmtDateTime(r.ts || r.timestamp || Date.now());
+      const row = [dt.date, dt.time, (r.clientName||''), (r.clientId||''), (r.result||''), (r.detail||'')]
+        .map(v => `"${String(v).replace(/"/g,'""')}"`)
+        .join(',');
+      lines.push(row);
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `accesos_${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+
+  function toggleReceptionMode(on){
+    const btn = $('#access-mode-btn');
+    if(!btn) return;
+    btn.textContent = on ? 'Modo Acceso: ON' : 'Modo Acceso: OFF';
+    btn.classList.toggle('on', !!on);
+    // en modo ON, enfocamos input para escáner
+    if(on){
+      setTimeout(() => $('#scan-input')?.focus(), 50);
+    }
+  }
+
+  async function validateScan(){
+    const input = $('#scan-input');
+    const ap = $('#anti-passback');
+    const scanRaw = input?.value || '';
+    const scan = normalizeScan(scanRaw);
+    if(!scan){
+      alert('Escanea o escribe un ID / Nombre');
+      return;
+    }
+
+    const st = await dpGetState();
+    const client = findClient(st, scan);
+    let result = 'DENIED';
+    let detail = '';
+    let badgeClass = 'bad';
+
+    if(!client){
+      detail = `No encontrado (${scan})`;
+      setStatus({ title: 'Acceso denegado', subtitle: detail, badgeClass });
+    } else {
+      const apMin = Number(ap?.value || 0);
+      const lastAp = lastAllowedWithin(st, client.id, apMin);
+      if(lastAp){
+        detail = `Anti-passback (${apMin} min)`;
+        setStatus({ title: 'Acceso denegado', subtitle: detail, badgeClass });
+      } else {
+        const mem = getActiveMembershipForClient(st, client.id);
+        if(!mem){
+          detail = 'Sin membresía vigente';
+          setStatus({ title: 'Acceso denegado', subtitle: detail, badgeClass });
+        } else {
+          result = 'ALLOWED';
+          badgeClass = 'ok';
+          const venc = new Date(mem.endTs);
+          const vencStr = `${venc.getFullYear()}-${String(venc.getMonth()+1).padStart(2,'0')}-${String(venc.getDate()).padStart(2,'0')}`;
+          detail = `Activa · Vence: ${vencStr}`;
+          setStatus({ title: 'Acceso permitido', subtitle: `${client.name} · ${detail}`, badgeClass });
+        }
+      }
+
+      // habilitar impresión
+      const pbtn = $('#print-cred');
+      if(pbtn) pbtn.disabled = false;
+      // guardar el cliente seleccionado en dataset
+      const box = $('#access-root');
+      if(box) box.dataset.lastClientId = String(client.id);
+    }
+
+    // registrar en log
+    const entry = {
+      ts: Date.now(),
+      clientId: client ? client.id : '',
+      clientName: client ? client.name : '',
+      result,
+      detail
+    };
+
+    const next = structuredClone(st);
+    next.accessLog = Array.isArray(next.accessLog) ? next.accessLog : [];
+    next.accessLog.push(entry);
+    await dpSetState(next);
+
+    // UI
+    const newSt = await dpGetState();
+    renderLastAccess(newSt);
+    renderLogTable(newSt);
+    if(input) input.value = '';
+    if($('#access-mode-btn')?.classList.contains('on')){
+      input?.focus();
+    }
+  }
+
+  async function printFromAccess(){
+    const root = $('#access-root');
+    const clientId = root?.dataset.lastClientId || '';
+    if(!clientId){
+      alert('Primero valida un cliente para poder imprimir.');
+      return;
+    }
+    const st = await dpGetState();
+    const client = (Array.isArray(st.clients) ? st.clients : []).find(c => String(c.id) === String(clientId));
+    if(!client){
+      alert('No se encontró el cliente en la lista.');
+      return;
+    }
+    await printCredentialForClient(client);
+  }
+
+  async function init(){
+    const root = $('#access-root');
+    if(!root) return;
+
+    const st = await dpGetState();
+    renderLastAccess(st);
+    renderLogTable(st);
+
+    // eventos
+    $('#validate-btn')?.addEventListener('click', validateScan);
+    $('#scan-input')?.addEventListener('keydown', (e) => {
+      if(e.key === 'Enter'){
+        e.preventDefault();
+        validateScan();
+      }
+    });
+    $('#clear-btn')?.addEventListener('click', async () => {
+      const st2 = await dpGetState();
+      // no borramos log automáticamente, solo limpia UI
+      $('#scan-input').value = '';
+      setStatus({ title: 'Listo para escanear', subtitle: 'Laptop: ideal para recepción · Tablet: también funciona', badgeClass: '' });
+      renderLastAccess(st2);
+      renderLogTable(st2);
+    });
+    $('#access-search')?.addEventListener('input', async () => {
+      const st3 = await dpGetState();
+      renderLogTable(st3);
+    });
+    $('#export-csv')?.addEventListener('click', async () => {
+      const st4 = await dpGetState();
+      exportCsv(st4);
+    });
+    $('#print-cred')?.addEventListener('click', printFromAccess);
+
+    // modo acceso
+    const modeBtn = $('#access-mode-btn');
+    if(modeBtn){
+      modeBtn.addEventListener('click', () => {
+        modeBtn.classList.toggle('on');
+        toggleReceptionMode(modeBtn.classList.contains('on'));
+      });
+      toggleReceptionMode(modeBtn.classList.contains('on'));
+    }
+
+    // estado inicial
+    setStatus({ title: 'Listo para escanear', subtitle: 'Laptop: ideal para recepción · Tablet: también funciona', badgeClass: '' });
+    $('#print-cred') && ($('#print-cred').disabled = true);
+  }
+
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
 })();
