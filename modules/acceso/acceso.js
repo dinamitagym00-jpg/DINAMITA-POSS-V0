@@ -208,7 +208,7 @@
     });
   }
 
-  async function getQrDataUrl(text){
+  async async function getQrDataUrl(text){
     const key = `qr:${text}`;
     try{
       const cached = await dpIdbGet(key);
@@ -394,7 +394,7 @@ function escapeHtml(s){
     renderAfterLog();
   }
 
-  async function printCredential(clientId){
+  async async function printCredential(clientId){
     const c = dpClientsGetById(clientId);
     if(!c){ alert("Cliente no encontrado."); return; }
 

@@ -293,7 +293,7 @@ ${clients.map(c=>`
   }
 
 // --- Credencial con QR (impresión 58mm) ---
-  async function getQrDataUrl(text){
+  async async function getQrDataUrl(text){
     const key = `qr:${text}`;
     // 1) cache en IndexedDB
     try{
@@ -321,7 +321,7 @@ ${clients.map(c=>`
     });
   }
 
-  async function printQrCredential(){
+  async async function printQrCredential(){
     const id = (idInput.value||'').trim();
     if(!id){
       alert('Primero selecciona un cliente (o captura su ID) para imprimir la credencial.');
