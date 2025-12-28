@@ -50,6 +50,17 @@ async function loadModule(name){
 
 document.querySelectorAll('#menu button[data-module]').forEach(b=>{
   b.addEventListener('click', ()=>{
+    // Modo Acceso: bloquea navegación (salvo Acceso) con PIN
+    try{
+      const accessMode = sessionStorage.getItem("dp_access_mode")==="1";
+      const target = b.dataset.module;
+      if(accessMode && target !== "acceso"){
+        const st = (typeof dpGetState === "function") ? dpGetState() : {};
+        const pin = String(st?.meta?.securityPin || "1234");
+        const input = prompt("Modo Acceso activo. Ingresa PIN para navegar:");
+        if(input !== pin) return;
+      }
+    }catch(e){}
     loadModule(b.dataset.module);
   });
 });

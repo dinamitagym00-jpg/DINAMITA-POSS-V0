@@ -416,6 +416,11 @@ function dpEnsureSeedData(){
     if(!Array.isArray(st.memberships)) st.memberships = [];
     if(!Array.isArray(st.expenses)) st.expenses = [];
     if(!Array.isArray(st.expenseCategories)) st.expenseCategories = [];
+    if(!Array.isArray(st.accessLogs)) st.accessLogs = [];
+
+    st.meta = st.meta || {};
+    st.meta.accessSettings = st.meta.accessSettings || { antiPassbackMinutes: 10 };
+    st.meta.securityPin = st.meta.securityPin || "1234";
 
     // If products exist but are unusable (missing name/sku), reseed demo products.
     const hasValidProduct = (st.products||[]).some(p=>p && (p.name || p.sku || p.barcode));

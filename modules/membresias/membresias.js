@@ -589,5 +589,14 @@ ${Array.from(mList.children).map(n=>`<div class="item">${n.querySelector(".mleft
   mStart.value = new Date().toISOString().slice(0,10);
   syncPlanFields();
   resetForm();
+  // Prefill desde módulo Acceso (si aplica)
+  try{
+    const preId = sessionStorage.getItem("dp_prefill_client_id");
+    if(preId){
+      mClientSearch.value = preId;
+      pickClient(preId);
+      sessionStorage.removeItem("dp_prefill_client_id");
+    }
+  }catch(e){}
   renderList();
 })();
